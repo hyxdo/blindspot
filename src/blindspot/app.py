@@ -8,32 +8,34 @@ import cv2
 import numpy as np
 import streamlit as st
 
+from blindspot import SAMPLE_IMAGE
+from blindspot.breakpoints import find_breakpoints
 from blindspot.cases import DEFAULT_ROOT, CaseStore, is_failure, pixel_hash, read_image
 from blindspot.model import Classifier, Prediction
-from blindspot.perturb import Perturbation, apply
+from blindspot.perturb import AXES, Perturbation, apply
 from blindspot.sweep import sweep
 
 ARCHES = ["resnet18", "resnet50", "mobilenet_v3_small"]
 MAX_SIDE = 1024  # keeps sliders responsive on large photos
 NO_LABEL = "Not sure: flag changes from the clean prediction"
 
-# key, label, min, max, step, format
+# key, label, format
 SLIDERS = {
     "Lighting": [
-        ("exposure", "Exposure (stops)", -4.0, 4.0, 0.1, "%.1f"),
-        ("contrast", "Contrast", 0.0, 3.0, 0.05, "%.2f"),
-        ("gamma", "Gamma", 0.2, 4.0, 0.05, "%.2f"),
+        ("exposure", "Exposure (stops)", "%.1f"),
+        ("contrast", "Contrast", "%.2f"),
+        ("gamma", "Gamma", "%.2f"),
     ],
     "Blur": [
-        ("blur", "Gaussian blur", 0.0, 0.1, 0.002, "%.3f"),
-        ("motion", "Motion blur", 0.0, 0.3, 0.005, "%.3f"),
-        ("motion_angle", "Motion angle", 0.0, 180.0, 5.0, "%.0f"),
+        ("blur", "Gaussian blur", "%.3f"),
+        ("motion", "Motion blur", "%.3f"),
+        ("motion_angle", "Motion angle", "%.0f"),
     ],
     "Framing": [
-        ("zoom", "Zoom", 0.5, 3.0, 0.05, "%.2f"),
-        ("shift_x", "Shift horizontally", -0.5, 0.5, 0.01, "%.2f"),
-        ("shift_y", "Shift vertically", -0.5, 0.5, 0.01, "%.2f"),
-        ("rotate", "Rotate", -180.0, 180.0, 1.0, "%.0f"),
+        ("zoom", "Zoom", "%.2f"),
+        ("shift_x", "Shift horizontally", "%.2f"),
+        ("shift_y", "Shift vertically", "%.2f"),
+        ("rotate", "Rotate", "%.0f"),
     ],
 }
 
@@ -43,8 +45,12 @@ def load_classifier(arch: str, checkpoint: str | None) -> Classifier:
     return Classifier.pretrained(arch, checkpoint)
 
 
-def reset_sliders() -> None:
-    st.session_state.update(Perturbation().to_dict())
+def load_settings(settings: Perturbation) -> None:
+    st.session_state.update(settings.to_dict())
+
+
+def use_sample() -> None:
+    st.session_state["image_path"] = str(SAMPLE_IMAGE)
 
 
 def load_case(store: CaseStore, case_id: str) -> None:
@@ -67,6 +73,7 @@ def choose_image() -> np.ndarray | None:
     left, right = st.columns(2)
     upload = left.file_uploader("Upload an image", type=["png", "jpg", "jpeg", "webp", "bmp"])
     path = right.text_input("Or a path on this computer", key="image_path").strip().strip('"')
+    right.button("Use the sample photo", on_click=use_sample)
     try:
         if path:
             return fit(read_image(path))
@@ -85,10 +92,52 @@ def show_predictions(column, title: str, image: np.ndarray, top: list[Prediction
     )
 
 
+def show_breakpoints(
+    store: CaseStore, image: np.ndarray, classifier: Classifier, true_label: str | None
+) -> None:
+    st.caption(
+        "Moves each setting away from normal until the prediction fails, "
+        "then narrows in on the smallest change that does it."
+    )
+    token = (pixel_hash(image), str(classifier.identity), true_label)
+    if st.button("Find breaking points"):
+        with st.spinner("Searching"):
+            st.session_state["breakpoints"] = (
+                token,
+                find_breakpoints(image, classifier, true_label=true_label),
+            )
+    stored = st.session_state.get("breakpoints")
+    if not stored or stored[0] != token:
+        return
+
+    result = stored[1]
+    if result.already_wrong:
+        st.warning("The model is already wrong on the unmodified image.")
+        return
+    st.write(f"**{len(result.broken)} of {len(result.points)}** directions broke the model.")
+    st.dataframe(
+        [
+            {
+                "Direction": f"{p.direction.axis} toward {p.direction.limit:g}",
+                "Breaks at": p.perturbation.describe() if p.broke else "Held to the limit",
+                "Share of range": f"{p.severity:.0%}" if p.broke else "",
+                "Prediction": p.top[0].label if p.broke else "",
+                "Confidence": f"{p.top[0].prob:.1%}" if p.broke else "",
+            }
+            for p in result.points
+        ],
+        hide_index=True,
+    )
+    if result.broken:
+        names = [p.perturbation.describe() for p in result.broken]
+        chosen = st.selectbox("Breaking point", names)
+        point = result.broken[names.index(chosen)]
+        st.button("Show this breaking point", on_click=load_settings, args=(point.perturbation,))
+
+
 def show_sweep(
     store: CaseStore, image: np.ndarray, classifier: Classifier, true_label: str | None
 ) -> None:
-    st.header("Sweep")
     st.caption("Tries every setting in the standard grid, one change at a time.")
     token = (pixel_hash(image), str(classifier.identity), true_label)
     if st.button("Run sweep"):
@@ -120,7 +169,6 @@ def show_sweep(
 
 
 def show_cases(store: CaseStore, classifier: Classifier) -> None:
-    st.header("Saved cases")
     cases = store.all()
     if not cases:
         st.caption("Failures you save appear here, ready to replay.")
@@ -176,36 +224,45 @@ def main() -> None:
         expected = st.selectbox("True class", [NO_LABEL, *sorted(set(classifier.labels))], key="expected")
         for group, sliders in SLIDERS.items():
             st.subheader(group)
-            for key, label, low, high, step, number_format in sliders:
-                st.slider(label, low, high, step=step, format=number_format, key=key)
-        st.button("Reset", on_click=reset_sliders)
+            for key, label, number_format in sliders:
+                axis = AXES[key]
+                st.slider(label, axis.low, axis.high, step=axis.step, format=number_format, key=key)
+        st.button("Reset", on_click=load_settings, args=(Perturbation(),))
 
     true_label = None if expected == NO_LABEL else expected
     image = choose_image()
     if image is None:
-        st.info("Add an image to start.")
+        st.info("Add an image or use the sample photo to start.")
+        st.header("Saved cases")
+        show_cases(store, classifier)
+        return
+
+    settings = Perturbation.from_dict({k: st.session_state[k] for k in Perturbation().to_dict()})
+    perturbed = apply(image, settings)
+    clean_top, perturbed_top = classifier.predict([image, perturbed])
+
+    if settings.is_identity:
+        st.info("Move a slider to perturb the image, or let Blindspot find the breaking points.")
+    elif is_failure(clean_top, perturbed_top, true_label):
+        st.error(f"Failure: the model now says **{perturbed_top[0].label}**.")
     else:
-        settings = Perturbation.from_dict({k: st.session_state[k] for k in Perturbation().to_dict()})
-        perturbed = apply(image, settings)
-        clean_top, perturbed_top = classifier.predict([image, perturbed])
+        st.success(f"Held: the model still says **{perturbed_top[0].label}**.")
 
-        if settings.is_identity:
-            st.info("Move a slider to perturb the image.")
-        elif is_failure(clean_top, perturbed_top, true_label):
-            st.error(f"Failure: the model now says **{perturbed_top[0].label}**.")
-        else:
-            st.success(f"Held: the model still says **{perturbed_top[0].label}**.")
+    before, after = st.columns(2)
+    show_predictions(before, "Original", image, clean_top)
+    show_predictions(after, f"Perturbed ({settings.describe()})", perturbed, perturbed_top)
 
-        before, after = st.columns(2)
-        show_predictions(before, "Original", image, clean_top)
-        show_predictions(after, f"Perturbed ({settings.describe()})", perturbed, perturbed_top)
+    if st.button("Save this case", disabled=settings.is_identity):
+        case = store.save(image, settings, classifier, true_label=true_label)
+        st.toast(f"Saved case {case.id}")
 
-        if st.button("Save this case", disabled=settings.is_identity):
-            case = store.save(image, settings, classifier, true_label=true_label)
-            st.toast(f"Saved case {case.id}")
+    breaks_tab, sweep_tab, cases_tab = st.tabs(["Breaking points", "Sweep", "Saved cases"])
+    with breaks_tab:
+        show_breakpoints(store, image, classifier, true_label)
+    with sweep_tab:
         show_sweep(store, image, classifier, true_label)
-
-    show_cases(store, classifier)
+    with cases_tab:
+        show_cases(store, classifier)
 
 
 main()

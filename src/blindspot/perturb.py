@@ -11,7 +11,7 @@ a given setting means the same thing at any resolution.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields, replace
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, NamedTuple
 
 import cv2
 import numpy as np
@@ -22,6 +22,27 @@ FAMILIES: dict[str, tuple[str, ...]] = {
     "lighting": ("exposure", "contrast", "gamma"),
     "blur": ("blur", "motion"),
     "framing": ("zoom", "shift_x", "shift_y", "rotate"),
+}
+
+
+class Axis(NamedTuple):
+    low: float
+    high: float
+    step: float
+
+
+# The range and resolution of each setting, shared by the sliders and searches.
+AXES: dict[str, Axis] = {
+    "exposure": Axis(-4.0, 4.0, 0.1),
+    "contrast": Axis(0.0, 3.0, 0.05),
+    "gamma": Axis(0.2, 4.0, 0.05),
+    "blur": Axis(0.0, 0.1, 0.002),
+    "motion": Axis(0.0, 0.3, 0.005),
+    "motion_angle": Axis(0.0, 180.0, 5.0),
+    "zoom": Axis(0.5, 3.0, 0.05),
+    "shift_x": Axis(-0.5, 0.5, 0.01),
+    "shift_y": Axis(-0.5, 0.5, 0.01),
+    "rotate": Axis(-180.0, 180.0, 1.0),
 }
 
 # Single-axis severities used by sweeps and by the held-out evaluation.

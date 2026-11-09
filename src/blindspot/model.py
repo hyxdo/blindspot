@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -87,6 +88,15 @@ class Classifier:
         if not batches:
             return np.zeros((0, len(self.labels)), dtype=np.float32)
         return np.concatenate(batches)
+
+    def resolve_label(self, label: str) -> str:
+        """Return the matching class name, or raise with the closest suggestions."""
+        by_lowercase = {name.lower(): name for name in self.labels}
+        if label.lower() in by_lowercase:
+            return by_lowercase[label.lower()]
+        close = difflib.get_close_matches(label, self.labels, n=3)
+        hint = f" Did you mean: {', '.join(close)}?" if close else ""
+        raise ValueError(f"unknown class {label!r}.{hint}")
 
     def rank(self, probs: np.ndarray, k: int = 5) -> list[Prediction]:
         top = np.argsort(-probs, kind="stable")[:k]

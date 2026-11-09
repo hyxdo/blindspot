@@ -5,13 +5,20 @@ gets wrong, then trains two versions with the same number of examples: one on
 misclassified examples, one on a random sample of the pool. Both are scored on
 held-out images, clean and perturbed, because robustness gained at the cost of
 clean accuracy is a trade rather than a win.
+
+Holding out a perturbation family keeps it out of training entirely, which tests
+whether the gains carry over to conditions the model never saw.
+
+Only the last ResNet block and head are trained, so everything before them gives
+the same output for every model. Those outputs are computed once and reused,
+which is what makes the comparison practical without a GPU.
 """
 
 from __future__ import annotations
 
 import copy
 import json
-from collections import defaultdict
+from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Literal, Sequence
@@ -19,7 +26,7 @@ from typing import Callable, Literal, Sequence
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset, TensorDataset
 from torchvision import datasets, models
 
 from .model import to_tensor
@@ -29,9 +36,12 @@ from .perturb import FAMILIES, Perturbation, apply, sweep_grid
 # Scoring only these logits means the pretrained head can be fine-tuned as is.
 IMAGENETTE_INDICES = (0, 217, 482, 491, 497, 566, 569, 571, 574, 701)
 DEFAULT_UNFROZEN = ("layer4", "fc")
+ARCHES = ("resnet18", "resnet34", "resnet50")
+BOOTSTRAP_SAMPLES = 2000
 
 Strategy = Literal["hard", "random"]
 STRATEGIES: tuple[Strategy, ...] = ("hard", "random")
+Log = Callable[[str], None]
 
 
 @dataclass(frozen=True)
@@ -62,6 +72,41 @@ class PerturbedDataset(Dataset):
         return self.preprocess(to_tensor(image)), int(self.labels[example.image])
 
 
+def split_resnet(model: nn.Module) -> tuple[nn.Module, nn.Module]:
+    """Split a ResNet into the frozen part and the part that gets trained."""
+    prefix = nn.Sequential(
+        model.conv1, model.bn1, model.relu, model.maxpool, model.layer1, model.layer2, model.layer3
+    )
+    suffix = nn.Sequential(
+        OrderedDict(
+            layer4=model.layer4, avgpool=model.avgpool, flatten=nn.Flatten(1), fc=model.fc
+        )
+    )
+    return prefix.eval(), suffix.eval()
+
+
+def join_resnet(base: nn.Module, suffix: nn.Module) -> nn.Module:
+    """Return a full copy of `base` that uses a fine-tuned suffix."""
+    model = copy.deepcopy(base)
+    model.layer4 = suffix.layer4
+    model.fc = suffix.fc
+    return model
+
+
+@torch.no_grad()  # not inference_mode: these outputs later feed a training graph
+def extract_features(
+    prefix: nn.Module,
+    dataset: Dataset,
+    batch_size: int = 64,
+    device: str | torch.device = "cpu",
+) -> TensorDataset:
+    features, targets = [], []
+    for batch, labels in DataLoader(dataset, batch_size=batch_size):
+        features.append(prefix(batch.to(device)).cpu())
+        targets.append(labels)
+    return TensorDataset(torch.cat(features), torch.cat(targets))
+
+
 def build_pool(
     num_images: int, grid: Sequence[Perturbation], per_image: int, rng: np.random.Generator
 ) -> list[Example]:
@@ -74,23 +119,28 @@ def build_pool(
     ]
 
 
-def select_examples(
-    pool: Sequence[Example],
-    wrong: np.ndarray,
-    budget: int,
-    strategy: Strategy,
-    rng: np.random.Generator,
-) -> list[Example]:
-    """Pick the training set for one strategy, drawing without replacement."""
+def training_grid(grid: Sequence[Perturbation], holdout: str | None) -> list[Perturbation]:
+    """Return the perturbations allowed in training."""
+    if holdout is None:
+        return list(grid)
+    if holdout not in FAMILIES:
+        raise ValueError(f"unknown perturbation family {holdout!r}")
+    return [p for p in grid if p.family != holdout]
+
+
+def select_indices(
+    wrong: np.ndarray, budget: int, strategy: Strategy, rng: np.random.Generator
+) -> np.ndarray:
+    """Pick pool positions for one strategy, drawing without replacement."""
     if strategy == "hard":
         candidates = np.flatnonzero(wrong)
     elif strategy == "random":
-        candidates = np.arange(len(pool))
+        candidates = np.arange(len(wrong))
     else:
         raise ValueError(f"unknown strategy {strategy!r}")
     if budget > len(candidates):
         raise ValueError(f"budget {budget} exceeds the {len(candidates)} candidates available")
-    return [pool[int(i)] for i in rng.choice(candidates, size=budget, replace=False)]
+    return rng.choice(candidates, size=budget, replace=False)
 
 
 @torch.inference_mode()
@@ -151,30 +201,46 @@ def finetune(
     return model
 
 
-def evaluate(
-    model: nn.Module,
-    images: Sequence[np.ndarray],
-    labels: Sequence[int],
-    preprocess: Callable[[torch.Tensor], torch.Tensor],
-    class_indices: Sequence[int],
-    grid: Sequence[Perturbation],
-    batch_size: int = 64,
-    device: str | torch.device = "cpu",
-) -> dict[str, float]:
-    """Score clean accuracy and accuracy under every perturbation in the grid."""
-    conditions = [Perturbation(), *grid]
-    examples = [Example(i, p) for p in conditions for i in range(len(images))]
-    dataset = PerturbedDataset(images, labels, examples, preprocess)
-    predicted, targets = predict(model, dataset, class_indices, batch_size, device)
-    correct = (predicted == targets).reshape(len(conditions), len(images))
+def scores_by_image(correct: np.ndarray, grid: Sequence[Perturbation]) -> dict[str, np.ndarray]:
+    """Turn a conditions x images correctness table into per-image scores.
 
-    by_family: dict[str, list[float]] = defaultdict(list)
-    for perturbation, row in zip(grid, correct[1:]):
-        by_family[perturbation.family].append(float(row.mean()))
+    Row 0 is the clean image; the remaining rows follow `grid`.
+    """
+    scores = {"clean": correct[0].astype(float), "perturbed": correct[1:].mean(axis=0)}
+    for family in FAMILIES:
+        rows = [row for row, p in enumerate(grid, start=1) if p.family == family]
+        if rows:
+            scores[family] = correct[rows].mean(axis=0)
+    return scores
+
+
+def bootstrap_difference(
+    a: np.ndarray, b: np.ndarray, rng: np.random.Generator, samples: int = BOOTSTRAP_SAMPLES
+) -> dict[str, float]:
+    """Return the mean of a - b with a 95% interval, resampling held-out images."""
+    difference = a - b
+    picks = rng.integers(0, len(difference), size=(samples, len(difference)))
+    means = difference[picks].mean(axis=1)
     return {
-        "clean": float(correct[0].mean()),
-        "perturbed": float(correct[1:].mean()),
-        **{family: float(np.mean(by_family[family])) for family in FAMILIES if family in by_family},
+        "difference": float(difference.mean()),
+        "low": float(np.percentile(means, 2.5)),
+        "high": float(np.percentile(means, 97.5)),
+    }
+
+
+def compare_scores(
+    a: dict[str, np.ndarray], b: dict[str, np.ndarray], rng: np.random.Generator
+) -> dict[str, dict[str, float]]:
+    return {metric: bootstrap_difference(a[metric], b[metric], rng) for metric in a}
+
+
+def summarize(runs: list[dict[str, float]]) -> dict[str, dict[str, float]]:
+    return {
+        metric: {
+            "mean": float(np.mean([run[metric] for run in runs])),
+            "std": float(np.std([run[metric] for run in runs])),
+        }
+        for metric in runs[0]
     }
 
 
@@ -185,13 +251,150 @@ class ExperimentConfig:
     arch: str = "resnet18"
     pool_images: int = 2000
     per_image: int = 3
-    eval_images: int = 1000
+    eval_images: int = 300
     budget: int = 500
     epochs: int = 3
     lr: float = 1e-3
     batch_size: int = 32
     seeds: int = 3
+    holdout_family: str | None = None
     save_checkpoints: bool = False
+
+
+def compare_strategies(
+    base: nn.Module,
+    preprocess: Callable[[torch.Tensor], torch.Tensor],
+    pool_images: Sequence[np.ndarray],
+    pool_labels: Sequence[int],
+    eval_images: Sequence[np.ndarray],
+    eval_labels: Sequence[int],
+    class_indices: Sequence[int],
+    config: ExperimentConfig,
+    grid: Sequence[Perturbation] | None = None,
+    log: Log = print,
+    device: str | torch.device = "cpu",
+    on_model: Callable[[str, int, nn.Module], None] | None = None,
+) -> dict:
+    """Train both strategies and score everything on the held-out images."""
+    grid = sweep_grid() if grid is None else list(grid)
+    allowed = training_grid(grid, config.holdout_family)
+    rng = np.random.default_rng(1)
+    prefix, suffix = split_resnet(base)
+    pool = build_pool(len(pool_images), allowed, config.per_image, rng)
+
+    log(f"computing frozen features for {len(pool)} pool examples")
+    pool_features = extract_features(
+        prefix, PerturbedDataset(pool_images, pool_labels, pool, preprocess), device=device
+    )
+    predicted, targets = predict(suffix, pool_features, class_indices, device=device)
+    wrong = predicted != targets
+    train_examples = min(config.budget, int(wrong.sum()))
+    if train_examples == 0:
+        raise RuntimeError("the baseline made no mistakes on the pool, so there is nothing to compare")
+    if train_examples < config.budget:
+        log(f"only {train_examples} misclassified examples; lowering both budgets to match")
+
+    conditions = [Perturbation(), *grid]
+    evaluation = [Example(i, p) for p in conditions for i in range(len(eval_images))]
+    log(f"computing frozen features for {len(evaluation)} held-out examples")
+    eval_features = extract_features(
+        prefix, PerturbedDataset(eval_images, eval_labels, evaluation, preprocess), device=device
+    )
+
+    def score(model: nn.Module) -> dict[str, np.ndarray]:
+        guesses, truth = predict(model, eval_features, class_indices, device=device)
+        return scores_by_image((guesses == truth).reshape(len(conditions), len(eval_images)), grid)
+
+    baseline = score(suffix)
+    mean_scores: dict[str, dict[str, np.ndarray]] = {}
+    strategies: dict[str, dict] = {}
+    for strategy in STRATEGIES:
+        runs = []
+        for seed in range(config.seeds):
+            log(f"fine-tuning {strategy}, seed {seed + 1} of {config.seeds}")
+            chosen = select_indices(wrong, train_examples, strategy, np.random.default_rng(seed))
+            tuned = finetune(
+                suffix,
+                Subset(pool_features, chosen.tolist()),
+                class_indices,
+                epochs=config.epochs,
+                lr=config.lr,
+                batch_size=config.batch_size,
+                seed=seed,
+                device=device,
+            )
+            runs.append(score(tuned))
+            if on_model is not None:
+                on_model(strategy, seed, join_resnet(base, tuned))
+        means = [{metric: float(values.mean()) for metric, values in run.items()} for run in runs]
+        strategies[strategy] = {"runs": means, "summary": summarize(means)}
+        mean_scores[strategy] = {
+            metric: np.mean([run[metric] for run in runs], axis=0) for metric in runs[0]
+        }
+
+    interval_rng = np.random.default_rng(2)
+    return {
+        "config": asdict(config),
+        "pool_size": len(pool),
+        "pool_wrong": int(wrong.sum()),
+        "train_examples": train_examples,
+        "eval_images": len(eval_images),
+        "conditions": len(grid),
+        "baseline": {metric: float(values.mean()) for metric, values in baseline.items()},
+        "strategies": strategies,
+        "comparisons": {
+            "hard - random": compare_scores(mean_scores["hard"], mean_scores["random"], interval_rng),
+            "hard - baseline": compare_scores(mean_scores["hard"], baseline, interval_rng),
+            "random - baseline": compare_scores(mean_scores["random"], baseline, interval_rng),
+        },
+    }
+
+
+def render_report(results: dict) -> str:
+    holdout = results["config"].get("holdout_family")
+    metrics = ["clean", *[f for f in FAMILIES if f in results["baseline"]], "perturbed"]
+    titles = {"clean": "clean", "perturbed": "all perturbed"}
+
+    def title(metric: str) -> str:
+        return f"{metric} (never trained on)" if metric == holdout else titles.get(metric, metric)
+
+    header = "| model | " + " | ".join(title(m) for m in metrics) + " |"
+    divider = "|---|" + "---|" * len(metrics)
+    seeds = results["config"]["seeds"]
+    lines = [
+        "# Blindspot experiment",
+        "",
+        f"Each model trained on {results['train_examples']} examples, drawn from a pool of "
+        f"{results['pool_size']} perturbed images ({results['pool_wrong']} misclassified by the baseline). "
+        f"Scored on {results['eval_images']} held-out images under {results['conditions']} perturbations. "
+        f"{seeds} seed{'s' if seeds != 1 else ''} per strategy.",
+        "",
+        "## Accuracy (mean ± std across seeds)",
+        "",
+        header,
+        divider,
+        "| baseline | " + " | ".join(f"{results['baseline'][m]:.3f}" for m in metrics) + " |",
+    ]
+    for strategy in STRATEGIES:
+        summary = results["strategies"][strategy]["summary"]
+        cells = [f"{summary[m]['mean']:.3f} ± {summary[m]['std']:.3f}" for m in metrics]
+        lines.append(f"| {strategy} | " + " | ".join(cells) + " |")
+    lines += [
+        "",
+        "## Differences (95% bootstrap interval over held-out images)",
+        "",
+        "An interval that excludes zero is evidence of a real difference on images like these.",
+        "",
+        header.replace("| model |", "| comparison |"),
+        divider,
+    ]
+    for name, comparison in results["comparisons"].items():
+        cells = [
+            f"{comparison[m]['difference']:+.3f} [{comparison[m]['low']:+.3f}, {comparison[m]['high']:+.3f}]"
+            for m in metrics
+        ]
+        lines.append(f"| {name.replace(' - ', ' − ')} | " + " | ".join(cells) + " |")
+    return "\n".join(lines) + "\n"
 
 
 def load_imagenette(
@@ -210,105 +413,37 @@ def load_imagenette(
     return images, labels
 
 
-def summarize(runs: list[dict[str, float]]) -> dict[str, dict[str, float]]:
-    return {
-        metric: {
-            "mean": float(np.mean([run[metric] for run in runs])),
-            "std": float(np.std([run[metric] for run in runs])),
-        }
-        for metric in runs[0]
-    }
-
-
-def render_report(results: dict) -> str:
-    metrics = ["clean", "perturbed", *FAMILIES]
-    lines = [
-        "# Blindspot experiment",
-        "",
-        f"Trained on {results['train_examples']} examples per model "
-        f"({results['pool_size']} in the pool, {results['pool_wrong']} misclassified by the baseline). "
-        f"Scored on {results['eval_images']} held-out images, averaged over "
-        f"{results['config']['seeds']} seeds (mean ± std).",
-        "",
-        "| model | " + " | ".join(metrics) + " |",
-        "|---|" + "---|" * len(metrics),
-        "| baseline | " + " | ".join(f"{results['baseline'][m]:.3f}" for m in metrics) + " |",
-    ]
-    for strategy in STRATEGIES:
-        summary = results["strategies"][strategy]["summary"]
-        cells = [f"{summary[m]['mean']:.3f} ± {summary[m]['std']:.3f}" for m in metrics]
-        lines.append(f"| {strategy} | " + " | ".join(cells) + " |")
-    return "\n".join(lines) + "\n"
-
-
-def run_experiment(
-    config: ExperimentConfig, log: Callable[[str], None] = print, device: str | None = None
-) -> dict:
+def run_experiment(config: ExperimentConfig, log: Log = print, device: str | None = None) -> dict:
+    if config.arch not in ARCHES:
+        raise ValueError(f"the experiment supports {', '.join(ARCHES)}")
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     out = Path(config.out)
     out.mkdir(parents=True, exist_ok=True)
 
     weights = models.get_model_weights(config.arch).DEFAULT
     base = models.get_model(config.arch, weights=weights).eval().to(device)
-    preprocess = weights.transforms()
-    grid = sweep_grid()
-
-    # One fixed pool, so seeds differ only in which examples are drawn and in SGD.
     rng = np.random.default_rng(0)
     log("loading Imagenette")
     pool_images, pool_labels = load_imagenette(config.data_root, "train", config.pool_images, rng)
     eval_images, eval_labels = load_imagenette(config.data_root, "val", config.eval_images, rng)
 
-    pool = build_pool(len(pool_images), grid, config.per_image, rng)
-    log(f"scoring the baseline on {len(pool)} perturbed pool examples")
-    predicted, targets = predict(
-        base, PerturbedDataset(pool_images, pool_labels, pool, preprocess),
-        IMAGENETTE_INDICES, device=device,
+    def save(strategy: str, seed: int, model: nn.Module) -> None:
+        (out / "checkpoints").mkdir(exist_ok=True)
+        torch.save(model.state_dict(), out / "checkpoints" / f"{strategy}_seed{seed}.pt")
+
+    results = compare_strategies(
+        base,
+        weights.transforms(),
+        pool_images,
+        pool_labels,
+        eval_images,
+        eval_labels,
+        IMAGENETTE_INDICES,
+        config,
+        log=log,
+        device=device,
+        on_model=save if config.save_checkpoints else None,
     )
-    wrong = predicted != targets
-    train_examples = min(config.budget, int(wrong.sum()))
-    if train_examples == 0:
-        raise RuntimeError("the baseline made no mistakes on the pool, so there is nothing to compare")
-    if train_examples < config.budget:
-        log(f"only {train_examples} misclassified examples; lowering both budgets to match")
-
-    log(f"evaluating the baseline on {len(eval_images)} held-out images")
-    score = lambda model: evaluate(
-        model, eval_images, eval_labels, preprocess, IMAGENETTE_INDICES, grid, device=device
-    )
-    results: dict = {
-        "config": asdict(config),
-        "pool_size": len(pool),
-        "pool_wrong": int(wrong.sum()),
-        "train_examples": train_examples,
-        "eval_images": len(eval_images),
-        "baseline": score(base),
-        "strategies": {},
-    }
-
-    for strategy in STRATEGIES:
-        runs = []
-        for seed in range(config.seeds):
-            log(f"fine-tuning {strategy}, seed {seed}")
-            chosen = select_examples(
-                pool, wrong, train_examples, strategy, np.random.default_rng(seed)
-            )
-            model = finetune(
-                base,
-                PerturbedDataset(pool_images, pool_labels, chosen, preprocess),
-                IMAGENETTE_INDICES,
-                epochs=config.epochs,
-                lr=config.lr,
-                batch_size=config.batch_size,
-                seed=seed,
-                device=device,
-            )
-            runs.append(score(model))
-            if config.save_checkpoints:
-                (out / "checkpoints").mkdir(exist_ok=True)
-                torch.save(model.state_dict(), out / "checkpoints" / f"{strategy}_seed{seed}.pt")
-        results["strategies"][strategy] = {"runs": runs, "summary": summarize(runs)}
-
     (out / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
     (out / "report.md").write_text(render_report(results), encoding="utf-8")
     log(f"wrote {out / 'report.md'}")

@@ -1,4 +1,4 @@
-"""Command line entry point: sweep, cases, replay, experiment, app."""
+"""Command line entry point: breakpoints, sweep, cases, replay, experiment, app."""
 
 from __future__ import annotations
 
@@ -14,14 +14,56 @@ from typing import Sequence
 from .cases import DEFAULT_ROOT
 
 
-def _sweep(args: argparse.Namespace) -> int:
-    from .cases import CaseStore, read_image
+def _open_target(args: argparse.Namespace):
+    """Load the image, model, and true label, turning bad input into clear errors."""
+    from .cases import read_image
     from .model import Classifier
+
+    try:
+        image = read_image(args.image)
+    except (OSError, ValueError) as error:
+        raise SystemExit(f"error: could not read {args.image}: {error}")
+    classifier = Classifier.pretrained(args.arch, args.checkpoint)
+    try:
+        label = classifier.resolve_label(args.label) if args.label else None
+    except ValueError as error:
+        raise SystemExit(f"error: {error}")
+    return image, classifier, label
+
+
+def _breakpoints(args: argparse.Namespace) -> int:
+    from .breakpoints import find_breakpoints
+    from .cases import CaseStore
+
+    image, classifier, label = _open_target(args)
+    result = find_breakpoints(image, classifier, true_label=label)
+    print(f"clean: {result.clean[0].label} ({result.clean[0].prob:.1%})")
+    if result.already_wrong:
+        print(f"the model is already wrong on the unmodified image, so {label!r} can't break further")
+        return 0
+
+    print(f"{len(result.broken)} of {len(result.points)} directions broke; most fragile first")
+    print("share of range  smallest change that fails   prediction")
+    for point in result.broken:
+        top = point.top[0]
+        print(f"{point.severity:>14.0%}  {point.perturbation.describe():<27}  {top.label} ({top.prob:.1%})")
+    held = [f"{p.direction.axis} to {p.direction.limit:g}" for p in result.points if not p.broke]
+    if held:
+        print("held all the way: " + ", ".join(held))
+    if args.save:
+        store = CaseStore(args.store)
+        for point in result.broken:
+            case = store.save(image, point.perturbation, classifier, true_label=label, note="breakpoint")
+            print(f"saved {case.id}")
+    return 0
+
+
+def _sweep(args: argparse.Namespace) -> int:
+    from .cases import CaseStore
     from .sweep import sweep
 
-    classifier = Classifier.pretrained(args.arch, args.checkpoint)
-    image = read_image(args.image)
-    result = sweep(image, classifier, true_label=args.label)
+    image, classifier, label = _open_target(args)
+    result = sweep(image, classifier, true_label=label)
     print(f"clean: {result.clean[0].label} ({result.clean[0].prob:.1%})")
     for row in result.rows:
         marker = "FAIL" if row.failed else "ok  "
@@ -30,7 +72,7 @@ def _sweep(args: argparse.Namespace) -> int:
     if args.save:
         store = CaseStore(args.store)
         for row in result.failures:
-            case = store.save(image, row.perturbation, classifier, true_label=args.label)
+            case = store.save(image, row.perturbation, classifier, true_label=label)
             print(f"saved {case.id}")
     return 0
 
@@ -51,7 +93,10 @@ def _replay(args: argparse.Namespace) -> int:
     from .model import Classifier
 
     store = CaseStore(args.store)
-    cases = [store.load(case_id) for case_id in args.ids] if args.ids else store.all()
+    try:
+        cases = [store.load(case_id) for case_id in args.ids] if args.ids else store.all()
+    except KeyError as error:
+        raise SystemExit(f"error: {error.args[0]}")
     if not cases:
         print(f"no saved cases in {store.root}")
         return 0
@@ -61,7 +106,12 @@ def _replay(args: argparse.Namespace) -> int:
     for case in cases:
         key = json.dumps(case.model, sort_keys=True)
         if key not in classifiers:
-            classifiers[key] = Classifier.pretrained(case.model["arch"], case.model["checkpoint"])
+            try:
+                classifiers[key] = Classifier.pretrained(case.model["arch"], case.model["checkpoint"])
+            except OSError as error:
+                print(f"{case.id}  CANNOT RUN  could not load its model: {error}")
+                all_reproduced = False
+                continue
         result = store.replay(case, classifiers[key])
         all_reproduced &= result.reproduced
         status = "reproduced" if result.reproduced else "CHANGED"
@@ -88,7 +138,15 @@ def _experiment(args: argparse.Namespace) -> int:
 def _app(args: argparse.Namespace) -> int:
     env = {**os.environ, "BLINDSPOT_CASES": str(args.store)}
     script = Path(__file__).with_name("app.py")
-    return subprocess.call([sys.executable, "-m", "streamlit", "run", str(script)], env=env)
+    # Local only: the app can open image and checkpoint paths on this computer.
+    return subprocess.call(
+        [
+            sys.executable, "-m", "streamlit", "run", str(script),
+            "--server.address", "localhost",
+            "--browser.gatherUsageStats", "false",
+        ],
+        env=env,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -100,13 +158,16 @@ def build_parser() -> argparse.ArgumentParser:
         sub.set_defaults(handler=handler)
         return sub
 
-    sweep = add("sweep", _sweep, "run one image through the perturbation grid")
-    sweep.add_argument("image")
-    sweep.add_argument("--arch", default="resnet18")
-    sweep.add_argument("--checkpoint", help="fine-tuned weights to load")
-    sweep.add_argument("--label", help="true ImageNet class name, if known")
-    sweep.add_argument("--save", action="store_true", help="save every failure as a case")
-    sweep.add_argument("--store", default=DEFAULT_ROOT)
+    def add_target(sub: argparse.ArgumentParser) -> None:
+        sub.add_argument("image")
+        sub.add_argument("--arch", default="resnet18")
+        sub.add_argument("--checkpoint", help="fine-tuned weights to load")
+        sub.add_argument("--label", help="true ImageNet class name, if known")
+        sub.add_argument("--save", action="store_true", help="save every failure as a case")
+        sub.add_argument("--store", default=DEFAULT_ROOT)
+
+    add_target(add("breakpoints", _breakpoints, "find the smallest change that breaks the model"))
+    add_target(add("sweep", _sweep, "run one image through the perturbation grid"))
 
     cases = add("cases", _cases, "list saved failures")
     cases.add_argument("--store", default=DEFAULT_ROOT)
@@ -115,18 +176,23 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("ids", nargs="*", help="case ids; all cases if omitted")
     replay.add_argument("--store", default=DEFAULT_ROOT)
 
+    from .perturb import FAMILIES
+
     experiment = add("experiment", _experiment, "compare hard-example and random fine-tuning")
     experiment.add_argument("--out", default="results/experiment")
     experiment.add_argument("--data-root", default="data")
-    experiment.add_argument("--arch", default="resnet18")
+    experiment.add_argument("--arch", default="resnet18", choices=["resnet18", "resnet34", "resnet50"])
     experiment.add_argument("--pool-images", type=int, default=2000)
     experiment.add_argument("--per-image", type=int, default=3)
-    experiment.add_argument("--eval-images", type=int, default=1000)
+    experiment.add_argument("--eval-images", type=int, default=300)
     experiment.add_argument("--budget", type=int, default=500)
     experiment.add_argument("--epochs", type=int, default=3)
     experiment.add_argument("--lr", type=float, default=1e-3)
     experiment.add_argument("--batch-size", type=int, default=32)
     experiment.add_argument("--seeds", type=int, default=3)
+    experiment.add_argument(
+        "--holdout-family", choices=list(FAMILIES), help="keep this family out of training entirely"
+    )
     experiment.add_argument("--save-checkpoints", action="store_true")
 
     app = add("app", _app, "open the interactive tool")
