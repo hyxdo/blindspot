@@ -1,47 +1,56 @@
 # Blindspot
 
-Image classifiers can be right about a photo and wrong about the same photo taken a little darker, a little blurrier, or framed a little differently. Blindspot helps you find those conditions, save them so they can be reproduced exactly, and test whether fine-tuning fixes them.
+[![CI](https://github.com/hyxdo/blindspot/actions/workflows/ci.yml/badge.svg)](https://github.com/hyxdo/blindspot/actions/workflows/ci.yml)
 
-It has two parts:
+Image classifiers can be right about a photo and wrong about the same photo taken a little darker, a little blurrier, or framed a little differently. Blindspot finds those conditions, saves them so they can be reproduced exactly, and tests whether fine-tuning fixes them.
 
-- **An interactive tool** for changing lighting, blur, and framing with sliders while watching a pretrained model's predictions, then saving what breaks it.
-- **An experiment** that fine-tunes a pretrained classifier on its own mistakes or on random samples, then compares robustness and clean accuracy on held-out images.
+![Blindspot showing a small gamma change flipping a pretrained model's prediction](docs/app.jpg)
 
 Built with Python, PyTorch, NumPy, OpenCV, and Streamlit.
 
-## Install
+## Try it
 
 Python 3.10 or newer.
 
 ```bash
+git clone https://github.com/hyxdo/blindspot.git
+cd blindspot
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
-```
-
-The first run downloads the pretrained weights from torchvision.
-
-## Interactive tool
-
-```bash
 blindspot app
 ```
 
-Add an image, move the sliders, and watch the original and perturbed predictions side by side. Set the true class if you know it; otherwise Blindspot flags any change from the clean prediction. **Run sweep** tries a standard grid of settings, and **Save this case** records a failure.
+Click **Use the sample photo**, then **Find breaking points**. The first run downloads the pretrained weights from torchvision.
 
-## Finding and replaying failures from the command line
+## Finding what breaks a model
+
+**Breaking points** answer the question a fixed grid can't: how small a change is enough? Blindspot moves each setting away from normal in both directions, stops at the first failure, then bisects to the smallest change that causes it. Results are ranked from most to least fragile.
+
+![Breaking points for the sample photo, ranked by fragility](docs/breakpoints.jpg)
+
+```bash
+blindspot breakpoints photo.jpg --label "golf ball" --save
+```
+
+Give the true class with `--label` if you know it. Without one, Blindspot counts any change from the clean prediction as a failure.
+
+**Sweeps** run an image through a standard grid of 34 settings:
 
 ```bash
 blindspot sweep photo.jpg --label "golf ball" --save
+```
+
+## Reproducing failures
+
+```bash
 blindspot cases
 blindspot replay
 ```
 
-`replay` regenerates each saved image and runs the recorded model again. It exits with status 1 if any prediction moved, so it can also serve as a regression check.
+`replay` regenerates each saved image and runs the recorded model again. It exits with status 1 if any prediction moved, so it also works as a regression check.
 
-### What a saved case contains
-
-| | |
+| A saved case contains | |
 |---|---|
 | Source image | Lossless PNG, verified against a hash of its pixels |
 | Settings | Every perturbation value |
@@ -51,27 +60,44 @@ blindspot replay
 
 Perturbations use no randomness, so the settings and source image fully determine the perturbed pixels. Blur and shift are measured as fractions of the image size, so a setting means the same thing at any resolution.
 
-## Fine-tuning experiment
+## Does fine-tuning fix it?
+
+The obvious idea is to train a model on its own mistakes. This experiment compares that with training on random samples, giving both the same number of examples and scoring everything on held-out images.
+
+| ResNet-18 accuracy | clean | lighting | framing | blur (never trained on) | all perturbed |
+|---|---|---|---|---|---|
+| Pretrained baseline | 98.7% | 92.2% | 90.8% | 58.8% | 85.7% |
+| Fine-tuned on random samples | 96.9% | 90.6% | 90.7% | 61.4% | 85.5% |
+| Fine-tuned on mistakes only | 90.4% | 80.8% | 82.0% | 48.1% | 75.5% |
+
+**Training only on mistakes made the model worse.** Compared with the baseline it lost 8.2 points of clean accuracy (95% interval 4.4 to 12.4) and 10.1 points across perturbed images (6.5 to 14.0), including on blur, which it never trained on.
+
+**Random sampling neither helped nor hurt overall.** Its change across perturbed images was -0.2 points (-1.4 to +1.0). The +2.7 points on blur is suggestive, but its interval (-0.4 to +5.5) includes zero.
+
+One likely explanation, not tested here, is that a model's mistakes are a narrow and unusual slice of the data. Training only on them may pull the model away from everything it was already getting right.
+
+### How the experiment works
+
+1. Apply random perturbations to [Imagenette](https://github.com/fastai/imagenette) training images, leaving the blur family out entirely.
+2. Find which of those examples the pretrained model gets wrong.
+3. Fine-tune the last ResNet block and the head on the same number of examples per strategy, repeated over 3 seeds. BatchNorm statistics stay frozen.
+4. Score the baseline and every fine-tuned model on validation images, clean and under all 34 perturbations.
+
+This run used 1,600 perturbed training examples, of which the baseline got 130 wrong, so each model trained on 130 examples. It was scored on 150 held-out images. The full numbers, including all pairwise intervals, are in [docs/experiment](docs/experiment/report.md).
+
+The layers before the trained block give the same output for every model, so those outputs are computed once and reused. This run took about 22 minutes on a laptop CPU.
 
 ```bash
-blindspot experiment --out results/experiment
+blindspot experiment --pool-images 800 --per-image 2 --eval-images 150 \
+    --budget 300 --holdout-family blur --out results/experiment
 ```
 
-The run uses [Imagenette](https://github.com/fastai/imagenette), a ten-class subset of ImageNet, downloaded on first use (about 100 MB).
+### What these results don't show
 
-The default settings score roughly 250,000 images, so use a GPU. On a CPU, shrink the run with `--pool-images`, `--eval-images`, `--budget`, and `--seeds`, and treat results from very small runs as a check that the pipeline works, not as findings.
-
-1. Apply random perturbations from the sweep grid to images from the training split.
-2. Find which of those examples the pretrained model gets wrong.
-3. Train two kinds of model on the **same number of examples**, repeated across seeds: `hard` draws from the misclassified examples, `random` draws from the whole pool.
-4. Score the baseline and both kinds of model on the validation split, clean and under every perturbation in the grid.
-
-Only the last ResNet block and the classifier head are trained, and BatchNorm statistics stay frozen. Results are written to `results.json` and `report.md`.
-
-Things to keep in mind when reading the results:
-
-- Imagenette comes from ImageNet, so the pretrained model may have seen some of these images. Absolute accuracy can run high; the comparison between models is the useful part.
-- The held-out images are new, but the held-out perturbations come from the same grid used for training. This measures recovery from known conditions, not robustness to unseen ones.
+- This is one model on one ten-class dataset, with a small training budget. The size of the effect could differ elsewhere.
+- The intervals capture uncertainty from which held-out images were used. They don't capture uncertainty from the choice of training pool.
+- Imagenette comes from ImageNet, so the pretrained model may have seen some of these images. Baseline accuracy may run high; the comparison between models is the useful part.
+- Only blur was held out. Other families may transfer differently.
 
 ## Tests
 
@@ -79,10 +105,17 @@ Things to keep in mind when reading the results:
 pytest
 ```
 
-The tests use a tiny stand-in model, so they run quickly and need no downloads.
+The tests use small stand-in models, so they run quickly and need no downloads.
 
 ## Roadmap
 
-- Hold out whole perturbation families from training to measure transfer to unseen conditions
-- Sweep combinations of settings instead of one at a time
+- Train on a mix of mistakes and correctly classified examples
+- Hold out each perturbation family in turn
+- Search combinations of settings instead of one at a time
 - Load custom labeled datasets
+
+## Credits and license
+
+The sample photo of Chelsea the cat is by Stéfan van der Walt, released under CC0 and distributed with [scikit-image](https://scikit-image.org/).
+
+Blindspot is available under the [MIT License](LICENSE).
