@@ -73,6 +73,29 @@ def test_loading_a_case_restores_controls_and_replays(app, tmp_path):
     assert any("Reproduced" in success.value for success in app.success)
 
 
+def test_sample_photo_loads_with_one_click(tmp_path, monkeypatch):
+    monkeypatch.setenv("BLINDSPOT_CASES", str(tmp_path))
+    monkeypatch.setattr(Classifier, "pretrained", classmethod(lambda *_a, **_k: make_classifier()))
+    st.cache_resource.clear()
+    test = AppTest.from_file(APP, default_timeout=30).run()
+    button(test, "Use the sample photo").click().run()
+    assert not test.exception
+    assert test.text_input(key="image_path").value.endswith("chelsea.jpg")
+    assert any("Move a slider" in info.value for info in test.info)
+
+
+def test_breaking_points_can_be_loaded_into_the_sliders(app):
+    button(app, "Find breaking points").click().run()
+    assert not app.exception
+    assert any("directions broke" in text.value for text in app.markdown)
+    button(app, "Show this breaking point").click().run()
+    assert not app.exception
+    assert any(
+        heading.value.startswith("Perturbed (") and "(none)" not in heading.value
+        for heading in app.subheader
+    )
+
+
 def test_sweep_can_save_every_failure(app, tmp_path):
     app.selectbox(key="expected").set_value("apple").run()
     button(app, "Run sweep").click().run()
