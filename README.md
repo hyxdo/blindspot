@@ -59,6 +59,8 @@ blindspot experiment --out results/experiment
 
 The run uses [Imagenette](https://github.com/fastai/imagenette), a ten-class subset of ImageNet, downloaded on first use (about 100 MB).
 
+The default settings score roughly 250,000 images, so use a GPU. On a CPU, shrink the run with `--pool-images`, `--eval-images`, `--budget`, and `--seeds`, and treat results from very small runs as a check that the pipeline works, not as findings.
+
 1. Apply random perturbations from the sweep grid to images from the training split.
 2. Find which of those examples the pretrained model gets wrong.
 3. Train two kinds of model on the **same number of examples**, repeated across seeds: `hard` draws from the misclassified examples, `random` draws from the whole pool.
