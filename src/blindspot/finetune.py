@@ -137,7 +137,9 @@ def finetune(
     # Stay in eval mode: a few hundred examples shouldn't rewrite BatchNorm statistics.
     model.eval()
     subset = torch.as_tensor(list(class_indices), device=device)
-    optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=1e-4)
+    # SGD on purpose: Adam's first steps move every weight by about `lr` regardless
+    # of gradient size, which wrecked pretrained accuracy in a single update.
+    optimizer = torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=1e-4)
     generator = torch.Generator().manual_seed(seed)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, generator=generator)
     for _ in range(epochs):
